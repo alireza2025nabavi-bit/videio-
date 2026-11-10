@@ -10,6 +10,7 @@ import math
 import cv2
 import numpy as np
 
+from . import cars as CR
 from . import fix as FX
 from . import glass as G
 from . import look as L
@@ -521,6 +522,7 @@ class Film:
         self.ui = UI()
         self.grain = L.Grain((W, H))
         self.snow = SN.Snow(W, H)
+        self.cars = CR.Cars(raw)             # petrol sedans replace the electric cars
         self.repairs = FX.Repairs(raw)
         self._hero = None
 
@@ -528,6 +530,8 @@ class Film:
         """Graded background plate for output frame i (camera move, sharpen, grade, bloom)."""
         idx = i if src_index is None else src_index
         src = np.asarray(self.raw[idx])
+        if self.cars.active(idx):
+            src = self.cars.apply(np.array(src, dtype=np.uint8), idx)
         if self.repairs.active(idx):
             src = self.repairs.apply(np.array(src, dtype=np.uint8), idx)
         if cam:

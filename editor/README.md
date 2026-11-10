@@ -30,6 +30,7 @@ python render.py --sheet 124 137 1      # contact sheet of a frame range -> prev
 | Transitions | Zoom-through with real integrated motion blur and RGB split, impact punch + exposure flash on the big hits, and one signature liquid wave that floods the race shot and reveals the product. |
 | Rhythm | The music is 128 BPM (first down-beat at 0.119 s). Reveals, splits, light sweeps and the small camera pulses are locked to that grid. |
 | Weather | Continuous snowfall, composited in-camera: three depth layers of particles that fall, drift on the wind and sway, from 1 px motes to out-of-focus bokeh in front of the lens. Density is scored per shot and the flakes pick up light from what is behind them. |
+| Petrol cars | The film is an engine-oil spot and the cars in shots 3, 8 and 9 are electric, so every electric car is replaced by a gold petrol sedan (BMW M5-style: quad chrome tips, boot lip, fuel flap, red LED tail-lights). A re-drawn still per key frame gives the car body; its difference against that frame gives the mask; the patch is then carried to the neighbouring frames with a chained optical-flow field measured on the original footage, feathered, exposure-matched and composited. The launch beat in shot 8 (where the near car leaves frame and its pose turns too far for a 2-D patch) is rebuilt from a single re-drawn plate pushed in slowly. Colour, lighting, reflections and timing stay the original. |
 | Text repair | The tachometer dial in shot 7 misspells the brand (`PAMRI`). The shot is tracked frame by frame, the wrong letters are inpainted away and `PAMIR` is drawn back in the same typeface, size and softness, behind the needle. |
 | Finish | Subtle filmic grade (cool shadows, warm highlights, richer gold), highlight bloom, vignette, fine film grain, fade-out. |
 
@@ -49,7 +50,7 @@ Everything creative sits in `lgk/scene.py`:
 * `SNOW` – snowfall density per shot (0 = clear, 1 = heavy); the field itself
   (flake count, sizes, fall speed, wind) lives in `lgk/snow.py`
 
-Supporting modules: `lgk/glass.py` (material renderer), `lgk/typo.py` (text with
+Supporting modules: `lgk/cars.py` (the petrol-car swap, plates in `assets/cars/`), `lgk/glass.py` (material renderer), `lgk/typo.py` (text with
 tracking and real pair kerning, icons), `lgk/look.py` (camera, grade, bloom,
 grain), `lgk/anim.py` (springs and easings), `lgk/snow.py` (the snowfall),
 `lgk/fix.py` (tracking + text repair).
