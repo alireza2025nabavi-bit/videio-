@@ -49,16 +49,27 @@ def _feather(mask, r=2.2):
     return np.clip((m - 0.5) * 2.5 + 0.5, 0.0, 1.0)
 
 
-def _colour_match(patch, dst, alpha):
-    """match the patch's exposure and contrast to the plate it lands on"""
-    sel = alpha > 0.5
-    if sel.sum() < 200:
+def _exposure_match(patch, dst, alpha):
+    """match the patch's exposure to the frame, measured *around* the car.
+
+    The patch is a re-painted version of the same frame, so its paint must keep
+    its own colour - only the drift of the optical-flow warp is corrected, and
+    that drift is measured on the background ring just outside the body, which
+    the re-paint left untouched.
+    """
+    m = (alpha > 0.02).astype(np.uint8)
+    if m.sum() < 2000:
         return patch
-    a, b = patch[sel], dst[sel]
-    am, bm = a.mean(0), b.mean(0)
-    asd, bsd = a.std(0) + 1e-3, b.std(0) + 1e-3
-    k = np.clip(bsd / asd, 0.75, 1.33)
-    return np.clip((patch - am) * k + bm, 0, 255)
+    ring = cv2.subtract(cv2.dilate(m, np.ones((41, 41), np.uint8)),
+                        cv2.dilate(m, np.ones((13, 13), np.uint8)))
+    sel = ring > 0
+    if sel.sum() < 2000:
+        return patch
+    w = np.array([0.114, 0.587, 0.299], np.float32)
+    lum_p = (patch[sel] @ w) + 1e-3
+    lum_d = (dst[sel] @ w) + 1e-3
+    k = float(np.clip(np.median(lum_d) / np.median(lum_p), 0.80, 1.30))
+    return np.clip(patch * k, 0, 255)
 
 
 def _motion_blur(img, alpha, vel):
@@ -77,6 +88,12 @@ def _motion_blur(img, alpha, vel):
     blurred = cv2.filter2D(img, -1, kernel)
     mb = np.clip(cv2.filter2D(alpha, -1, kernel), 0.0, 1.0)
     return img * (1 - mb[..., None]) + blurred * mb[..., None]
+
+
+def gold_mask(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, (10, 85, 55), (42, 255, 255))
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
 
 
 def body_mask(plate, frame, thr=90, min_area=3000):
@@ -119,7 +136,73 @@ def body_mask(plate, frame, thr=90, min_area=3000):
         cnts, _ = cv2.findContours(((lab == k).astype(np.uint8) * 255),
                                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(out, cnts, -1, 255, -1)
-    return out
+    # a solid body: close the gaps a shadow line cuts through a flank, then fill
+    # every enclosed hole so no sliver of the original car can survive the paste
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, np.ones((23, 23), np.uint8))
+    flood = out.copy()
+    cv2.floodFill(flood, np.zeros((SH + 2, SW + 2), np.uint8), (0, 0), 255)
+    core = cv2.bitwise_or(out, cv2.bitwise_not(flood))
+    core = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+    # the replacement is painted the same colour as the car it replaces, so the
+    # difference leaves holes across the flank: the gold paint of the *source*
+    # car, near the difference, is added to the mask
+    ylim = int(max(c[2] + c[4] for c in comps if c[4] >= 0.45 * tall)) + 4
+    above = np.zeros((SH, SW), np.uint8)
+    above[:max(1, ylim), :] = 255
+    gold = cv2.bitwise_and(gold_mask(frame), cv2.dilate(core, np.ones((61, 61), np.uint8)))
+    gold = cv2.bitwise_and(gold, above)
+    out = cv2.bitwise_or(core, gold)
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    flood = out.copy()
+    cv2.floodFill(flood, np.zeros((SH + 2, SW + 2), np.uint8), (0, 0), 255)
+    out = cv2.bitwise_or(out, cv2.bitwise_not(flood))
+    out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    # the car's own reflection on the wet floor stops at the wheels: anything
+    # below that line is floor, not body, and must stay out of the snow mask
+    core = cv2.bitwise_and(core, above)
+    return out, core
+
+
+def blacken(img, mask):
+    """re-paint the gold bodies black, keeping their form and their highlights.
+
+    The plates are re-drawn gold cars; the film needs a black one.  Mapping the
+    body's own luminance through a steep curve keeps every panel line, every
+    reflection and every specular streak, so the car still reads as a car - it is
+    the same geometry, only the paint changed.  Red tail-lights are left alone.
+    """
+    f = img.astype(np.float32)
+    b, g, r = f[..., 0], f[..., 1], f[..., 2]
+    t = np.clip((0.299 * r + 0.587 * g + 0.114 * b) / 255.0, 0.0, 1.0)
+    t = cv2.GaussianBlur(t, (0, 0), 4.0)           # smooth, so the paint is not blotchy
+    v = 0.045 + 0.60 * np.clip((t - 0.26) / 0.60, 0.0, 1.0) ** 1.55
+    paint = np.dstack([v * 0.96, v * 0.99, v * 1.07]) * 255.0
+    red = (g < 0.35 * r) & (b < 0.35 * r) & (r > 80)   # tail-lights stay red
+    body = np.where(red[..., None], f, paint)
+    m = (mask > 0)[..., None]
+    return np.where(m, body, f).astype(np.uint8)
+
+
+def degold(img):
+    """turn the gold alloy in the wheel close-up into dark gunmetal.
+
+    The car is black now, so its wheels cannot stay gold.  Only the gold paint
+    is touched: the tyre, the brake disc and the reflections keep their own
+    pixels, and the rim keeps its highlights so the metal still turns.
+    """
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    f = img.astype(np.float32)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, (8, 70, 45), (45, 255, 255))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    a = cv2.GaussianBlur(m.astype(np.float32) / 255.0, (0, 0), 2.0)[..., None]
+    t = np.clip((0.114 * f[..., 0] + 0.587 * f[..., 1] + 0.299 * f[..., 2]) / 255.0, 0, 1)
+    t = cv2.GaussianBlur(t, (0, 0), 2.0)
+    v = 0.055 + 0.72 * np.clip((t - 0.18) / 0.62, 0.0, 1.0) ** 1.5
+    metal = np.dstack([v * 0.98, v * 1.00, v * 1.04]) * 255.0
+    out = np.clip(f * (1 - a) + metal * a, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +218,11 @@ class Patch:
         if ed is None:
             raise FileNotFoundError(name)
         self.edit = cv2.resize(ed, (SW, SH), interpolation=cv2.INTER_AREA)
-        self.mask = body_mask(self.edit, bgr)
+        self.mask, self.core = body_mask(self.edit, bgr)
+        self.edit = blacken(self.edit, self.mask)
         self._maps = None
+        self._last = (None, None)
+        self._last_core = (None, None)
 
     # -- optical flow between two source frames (per-pixel, frame m -> frame n)
     def _step(self, m, n):
@@ -182,12 +268,20 @@ class Patch:
         col = cv2.remap(self.edit, Mx, My, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         msk = cv2.remap(self.mask, Mx, My, cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        a = _feather(msk, 2.2)
+        self._last = (i, msk)
+        self._last_core = (i, cv2.remap(self.core, Mx, My, cv2.INTER_NEAREST,
+                                        borderMode=cv2.BORDER_CONSTANT, borderValue=0))
+        # the pasted body is a little larger than the one being replaced (two
+        # different cars), so the alpha is grown: the extra ring lays the plate's
+        # own background over the destination's background, which is invisible,
+        # while no sliver of the old paint can survive at the silhouette
+        msk = cv2.dilate(msk, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+        a = _feather(msk, 3.2)
         if a.max() < 0.02:
             return img_bgr
         col = _motion_blur(col.astype(np.float32), a, vel)
         dst = img_bgr.astype(np.float32)
-        col = _colour_match(col, dst, a)
+        col = _exposure_match(col, dst, a)
         out = dst * (1 - a[..., None]) + col * a[..., None]
         return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -196,12 +290,19 @@ class Patch:
 #  the launch beat, rebuilt from a single plate
 # ---------------------------------------------------------------------------
 class Hero:
-    def __init__(self, f0, f1, name):
+    def __init__(self, f0, f1, name, raw=None, key=258):
         self.f0, self.f1 = f0, f1
         im = cv2.imread(os.path.join(ASSETS, name))
         if im is None:
             raise FileNotFoundError(name)
-        self.base = cv2.resize(im, (SW, SH), interpolation=cv2.INTER_AREA)
+        plate = cv2.resize(im, (SW, SH), interpolation=cv2.INTER_AREA)
+        self.mask = None
+        self.core = None
+        if raw is not None:
+            self.mask, self.core = body_mask(plate, np.asarray(raw[key])[:, :, ::-1].copy())
+            plate = blacken(plate, self.mask)
+        self.base = plate
+        self._last = (None, None)
 
     def frame(self, i):
         t = (i - self.f0) / float(max(1, self.f1 - self.f0 - 1))
@@ -214,6 +315,12 @@ class Hero:
         dy = 0.5 * math.cos(0.63 * (i - self.f0))
         out = cv2.warpAffine(out, np.float32([[1, 0, dx], [0, 1, dy]]), (SW, SH),
                              flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        if self.core is not None:
+            mk = cv2.warpAffine(self.core, M, (SW, SH), flags=cv2.INTER_NEAREST,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            mk = cv2.warpAffine(mk, np.float32([[1, 0, dx], [0, 1, dy]]), (SW, SH),
+                                flags=cv2.INTER_NEAREST, borderValue=0)
+            self._last = (i, mk)
         return out
 
 
@@ -248,11 +355,27 @@ class Cars:
             self._patches[key] = p
         return p
 
+    def cover(self, i):
+        """silhouette of the cars in frame i (uint8 0/255), or None"""
+        if HERO[0] <= i <= HERO[1]:
+            if self._hero is None:
+                self._hero = Hero(HERO[0], HERO[1], HERO[2], raw=self.raw, key=258)
+            idx, mk = self._hero._last
+            return mk if idx == i else None
+        spec = self._spec_for(i)
+        if spec is None:
+            return None
+        p = self._patches.get(spec[3])
+        if p is None or not p.has(i):
+            return None
+        idx, mk = p._last_core
+        return mk if idx == i else None
+
     def apply(self, img, i):
         """img: RGB uint8 (SH, SW, 3) -> RGB uint8, cars swapped"""
         if HERO[0] <= i <= HERO[1]:
             if self._hero is None:
-                self._hero = Hero(*HERO)
+                self._hero = Hero(HERO[0], HERO[1], HERO[2], raw=self.raw, key=258)
             return cv2.cvtColor(self._hero.frame(i), cv2.COLOR_BGR2RGB)
         spec = self._spec_for(i)
         if spec is None:

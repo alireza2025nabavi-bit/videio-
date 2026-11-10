@@ -16,6 +16,7 @@ from . import glass as G
 from . import look as L
 from . import snow as SN
 from . import typo as T
+from . import winter as WT
 from .anim import (Track, clamp, ease_in_cubic, ease_in_expo, ease_in_out_cubic, ease_in_quad,
                    ease_out_cubic, ease_out_expo, ease_out_quad, lerp, seg, smooth, spring)
 
@@ -28,7 +29,7 @@ UI_MAX_SAMPLES = 30
 GRAIN = 0.009
 # snowfall density per shot (0 = clear, 1 = heavy); the weather runs through the
 # whole film, heaviest out on the track and around the frozen garage
-SNOW = [0.55, 0.30, 1.00, 0.85, 0.70, 0.20, 0.35, 0.95, 0.70]
+SNOW = [0.85, 0.62, 1.00, 0.95, 0.90, 0.55, 0.72, 1.00, 0.88]
 
 
 def beat(k):
@@ -523,6 +524,7 @@ class Film:
         self.grain = L.Grain((W, H))
         self.snow = SN.Snow(W, H)
         self.cars = CR.Cars(raw)             # petrol sedans replace the electric cars
+        self.winter = WT.Ground(self.cars)   # the track is buried in snow
         self.repairs = FX.Repairs(raw)
         self._hero = None
 
@@ -532,6 +534,10 @@ class Film:
         src = np.asarray(self.raw[idx])
         if self.cars.active(idx):
             src = self.cars.apply(np.array(src, dtype=np.uint8), idx)
+        if 176 <= idx < 190:                 # wheel close-up: black car, dark rims
+            src = CR.degold(np.ascontiguousarray(src, dtype=np.uint8))
+        if shot_of(idx) in WT.ROAD:
+            src = self.winter.apply(np.ascontiguousarray(src, dtype=np.uint8), idx, shot_of(idx))
         if self.repairs.active(idx):
             src = self.repairs.apply(np.array(src, dtype=np.uint8), idx)
         if cam:
